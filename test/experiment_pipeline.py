@@ -1,7 +1,8 @@
-"""Dataset assessment and repeatable experiments for bug-report classification.
+"""Dataset assessment and repeatable model-comparison experiments.
 
-The second-opinion LLM sees only report text, never dataset labels or split examples.
-Its agreement with synthetic/unverified labels is a diagnostic, not proof of truth.
+The second-opinion LLM receives report text only (no labels, root causes, or
+resolution fields). Agreement with synthetic/unverified annotations is a
+diagnostic signal, not evidence that either annotation is correct.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dataset_utils import LABELS, SEVERITY_LABELS, build_text, load_jsonl, safe_label
+from dataset_utils import LABELS, SEVERITY_LABELS, build_text, load_jsonl
 
 try:
     from openai import OpenAI
@@ -60,7 +61,7 @@ def _field_present(value: Any) -> bool:
 
 
 def assess_dataset(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Return reproducible descriptive statistics and basic data-quality checks."""
+    """Return descriptive statistics and basic data-quality checks."""
     labels = Counter(str(r.get("ground_truth_label", "<missing>")) for r in records)
     severities = Counter(str(r.get("severity", "<missing>")) for r in records)
     splits = Counter(str(_metadata(r).get("split", "train")).lower() for r in records)
@@ -74,7 +75,6 @@ def assess_dataset(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
     invalid_labels = sum(_valid_label(r.get("ground_truth_label"), LABELS) is None for r in records)
     invalid_severity = sum(_valid_label(r.get("severity"), SEVERITY_LABELS) is None for r in records)
-
     return {
         "n_samples": len(records),
         "label_distribution": dict(sorted(labels.items())),
@@ -93,9 +93,9 @@ def assess_dataset(records: list[dict[str, Any]]) -> dict[str, Any]:
         "invalid_type_labels": invalid_labels,
         "invalid_severity_labels": invalid_severity,
         "warnings": [
-            "Nếu annotation_status là synthetic-unverified, các metric phản ánh mức khớp với nhãn hiện có, không khẳng định độ đúng thực tế.",
-            "Kiểm tra rò rỉ giữa train/test theo kịch bản gốc hoặc template trước khi diễn giải kết quả.",
-            "Thống kê thiếu trường không đồng nghĩa lỗi dữ liệu: một số trường có thể tùy chọn.",
+            "Metric đo mức khớp với nhãn hiện có; synthetic-unverified không được xem là nhãn đúng đã xác minh.",
+            "Kiểm tra leakage giữa train/test theo kịch bản/template trước khi diễn giải kết quả.",
+            "Trường trống có thể là tùy chọn, không mặc nhiên là lỗi dữ liệu.",
         ],
     }
 
@@ -120,14 +120,8 @@ def classification_metrics(y_true: list[str], y_pred: list[str], labels: list[st
 def evaluate_predictions(records: list[dict[str, Any]], predictions: list[dict[str, Any]]) -> dict[str, Any]:
     if len(records) != len(predictions):
         raise ValueError("Số prediction không khớp số record.")
-    type_pairs = [
-        (_valid_label(r.get("ground_truth_label"), LABELS), _valid_label(p.get("ground_truth_label"), LABELS))
-        for r, p in zip(records, predictions)
-    ]
-    severity_pairs = [
-        (_valid_label(r.get("severity"), SEVERITY_LABELS), _valid_label(p.get("severity"), SEVERITY_LABELS))
-        for r, p in zip(records, predictions)
-    ]
+    type_pairs = [(_valid_label(r.get("ground_truth_label"), LABELS), _valid_label(p.get("ground_truth_label"), LABELS)) for r, p in zip(records, predictions)]
+    severity_pairs = [(_valid_label(r.get("severity"), SEVERITY_LABELS), _valid_label(p.get("severity"), SEVERITY_LABELS)) for r, p in zip(records, predictions)]
     type_pairs = [(a, b) for a, b in type_pairs if a is not None and b is not None]
     severity_pairs = [(a, b) for a, b in severity_pairs if a is not None and b is not None]
     if not type_pairs or not severity_pairs:
@@ -167,12 +161,11 @@ def _predict(system: str, train: list[dict[str, Any]], test: list[dict[str, Any]
     client = OpenAI(api_key=api_key, base_url=os.getenv("OPENAI_BASE_URL") or None)
     predictions: list[dict[str, Any]] = []
     for index, record in enumerate(selected, start=1):
-        # Do not expose gold labels, root causes, resolutions, or training examples.
+        # Deliberately omit ground truth, root cause, resolution, and few-shot labels.
         prompt = (
-            "Phân loại báo cáo lỗi phần mềm. Chọn bug_type trong UI, API, LOGIC; "
-            "severity trong LOW, MEDIUM, HIGH, CRITICAL. Dựa trên nội dung báo cáo; "
-            "nếu thiếu bằng chứng, chọn nhãn hợp lý nhất. Chỉ trả JSON với các khóa "
-            "bug_type và severity.\n\nBáo cáo:\n" + build_text(record)
+            "Bạn là người đánh giá độc lập báo cáo lỗi phần mềm. Chọn bug_type trong UI, API, LOGIC; "
+            "severity trong LOW, MEDIUM, HIGH, CRITICAL. Chỉ trả JSON với khóa bug_type và severity. "
+            "Không suy đoán ngoài bằng chứng có trong báo cáo.\n\nBáo cáo:\n" + build_text(record)
         )
         response = client.chat.completions.create(
             model=model_name,
@@ -197,47 +190,101 @@ def _predict(system: str, train: list[dict[str, Any]], test: list[dict[str, Any]
 
 
 def _summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
-    metric_paths = [
-        ("bug_type", "accuracy"), ("bug_type", "macro_f1"), ("bug_type", "weighted_f1"),
-        ("severity", "accuracy"), ("severity", "macro_f1"), ("severity", "weighted_f1"),
-        (None, "severity_ordinal_mae"),
-    ]
+    paths = [("bug_type", "accuracy"), ("bug_type", "macro_f1"), ("bug_type", "weighted_f1"),
+             ("severity", "accuracy"), ("severity", "macro_f1"), ("severity", "weighted_f1"),
+             (None, "severity_ordinal_mae")]
     summary: dict[str, Any] = {}
-    for section, metric in metric_paths:
+    for section, metric in paths:
         values = [run["metrics"][section][metric] if section else run["metrics"][metric] for run in runs]
         key = f"{section}.{metric}" if section else metric
         summary[key] = {"mean": statistics.mean(values), "std": statistics.stdev(values) if len(values) > 1 else 0.0}
     return summary
 
 
-def _write_outputs(output_dir: Path, results: dict[str, Any]) -> None:
+def _flat_run_row(experiment: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+    m = run["metrics"]
+    return {
+        "system": experiment["system"], "model": experiment.get("model") or experiment["system"],
+        "run": run["run"], "seed": run["seed"], "n_test": run["n_test"],
+        "elapsed_seconds": run["elapsed_seconds"],
+        "type_accuracy": m["bug_type"]["accuracy"], "type_balanced_accuracy": m["bug_type"]["balanced_accuracy"],
+        "type_macro_precision": m["bug_type"]["macro_precision"], "type_macro_recall": m["bug_type"]["macro_recall"],
+        "type_macro_f1": m["bug_type"]["macro_f1"], "type_weighted_f1": m["bug_type"]["weighted_f1"],
+        "severity_accuracy": m["severity"]["accuracy"], "severity_balanced_accuracy": m["severity"]["balanced_accuracy"],
+        "severity_macro_f1": m["severity"]["macro_f1"], "severity_weighted_f1": m["severity"]["weighted_f1"],
+        "severity_ordinal_mae": m["severity_ordinal_mae"],
+    }
+
+
+def _write_outputs(output_dir: Path, results: dict[str, Any], export_excel: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(results, handle, ensure_ascii=False, indent=2)
-    with (output_dir / "metrics.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["system", "run", "seed", "n_test", "type_accuracy", "type_macro_f1", "type_weighted_f1", "severity_accuracy", "severity_macro_f1", "severity_weighted_f1", "severity_ordinal_mae"])
-        writer.writeheader()
-        for experiment in results["experiments"]:
-            for run in experiment.get("runs", []):
-                metrics = run["metrics"]
-                writer.writerow({
-                    "system": experiment["system"], "run": run["run"], "seed": run["seed"], "n_test": run["n_test"],
-                    "type_accuracy": metrics["bug_type"]["accuracy"], "type_macro_f1": metrics["bug_type"]["macro_f1"],
-                    "type_weighted_f1": metrics["bug_type"]["weighted_f1"], "severity_accuracy": metrics["severity"]["accuracy"],
-                    "severity_macro_f1": metrics["severity"]["macro_f1"], "severity_weighted_f1": metrics["severity"]["weighted_f1"],
-                    "severity_ordinal_mae": metrics["severity_ordinal_mae"],
-                })
+
+    run_rows = [_flat_run_row(exp, run) for exp in results["experiments"] for run in exp.get("runs", [])]
+    if run_rows:
+        columns = list(run_rows[0])
+        with (output_dir / "metrics.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(run_rows)
+
+    comparison_rows = []
+    for exp in results["experiments"]:
+        aggregate = exp.get("aggregate", {})
+        row: dict[str, Any] = {"system": exp["system"], "model": exp.get("model") or exp["system"]}
+        for key, value in aggregate.items():
+            row[f"{key}_mean"] = value["mean"]
+            row[f"{key}_std"] = value["std"]
+        comparison_rows.append(row)
+    if comparison_rows:
+        columns = list(dict.fromkeys(key for row in comparison_rows for key in row))
+        with (output_dir / "model_comparison.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(comparison_rows)
+
+    if export_excel:
+        try:
+            from openpyxl import Workbook
+        except ImportError as exc:
+            raise RuntimeError("Xuất Excel cần openpyxl. Cài bằng: pip install openpyxl") from exc
+        workbook = Workbook()
+        summary_sheet = workbook.active
+        summary_sheet.title = "Model comparison"
+        if comparison_rows:
+            summary_columns = list(dict.fromkeys(key for row in comparison_rows for key in row))
+            summary_sheet.append(summary_columns)
+            for row in comparison_rows:
+                summary_sheet.append([row.get(column) for column in summary_columns])
+        runs_sheet = workbook.create_sheet("Runs")
+        if run_rows:
+            runs_sheet.append(list(run_rows[0]))
+            for row in run_rows:
+                runs_sheet.append(list(row.values()))
+        dataset_sheet = workbook.create_sheet("Dataset stats")
+        dataset_sheet.append(["Statistic", "Value"])
+        for key, value in results["dataset_assessment"].items():
+            dataset_sheet.append([key, json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value])
+        for sheet in workbook.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cells in sheet.columns:
+                width = min(max(max(len(str(cell.value or "")) for cell in cells) + 2, 12), 48)
+                sheet.column_dimensions[cells[0].column_letter].width = width
+        workbook.save(output_dir / "experiment_report.xlsx")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Thống kê dataset và chạy thí nghiệm phân loại bug có thể lặp lại.")
+    parser = argparse.ArgumentParser(description="Thống kê dataset và so sánh các hệ thống phân loại bug.")
     parser.add_argument("--dataset", default=str(ROOT / "data" / "bug_dataset.jsonl"), help="Đường dẫn JSONL")
     parser.add_argument("--scenario", choices=["stats", "rule", "ml", "second-opinion", "all"], default="all")
-    parser.add_argument("--repeats", type=int, default=1, help="Số lần chạy; LLM sẽ gọi lại và có thể phát sinh chi phí")
-    parser.add_argument("--seed", type=int, default=42, help="Seed gốc, mỗi lần chạy dùng seed + run index")
+    parser.add_argument("--repeats", type=int, default=1, help="Số lần chạy; LLM có thể phát sinh chi phí mỗi lần")
+    parser.add_argument("--seed", type=int, default=42, help="Seed gốc, mỗi lần dùng seed + số thứ tự run")
     parser.add_argument("--model", default=os.getenv("SECOND_OPINION_MODEL", "gpt-4o-mini"), help="Model LLM đánh giá độc lập")
-    parser.add_argument("--llm-limit", type=int, default=None, help="Chỉ gọi LLM trên N mẫu đầu của test; mặc định dùng toàn bộ test")
+    parser.add_argument("--llm-limit", type=int, default=None, help="Giới hạn số mẫu test gửi tới LLM")
     parser.add_argument("--output-dir", default=None, help="Thư mục output; mặc định test/runs/<UTC timestamp>")
+    parser.add_argument("--excel", action="store_true", help="Xuất thêm experiment_report.xlsx (cần openpyxl)")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats phải >= 1")
@@ -254,13 +301,16 @@ def main() -> None:
     print("=== Dataset assessment ===")
     print(json.dumps(stats, ensure_ascii=False, indent=2))
     if args.scenario == "stats":
+        output_dir = Path(args.output_dir).expanduser() if args.output_dir else ROOT / "runs" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "dataset_stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Đã lưu thống kê tại {output_dir / 'dataset_stats.json'}")
         return
 
     train = [r for r in records if str(_metadata(r).get("split", "train")).lower() == "train"]
     test = [r for r in records if str(_metadata(r).get("split", "train")).lower() == "test"]
     if not train or not test:
-        raise ValueError("Cần có cả split train và test; pipeline không tự tạo split để tránh đánh giá sai.")
-
+        raise ValueError("Cần có split train và test; pipeline không tự tạo split.")
     systems = ["rule", "ml", "second-opinion"] if args.scenario == "all" else [args.scenario]
     experiments = []
     for system in systems:
@@ -288,10 +338,12 @@ def main() -> None:
         "base_seed": args.seed,
         "dataset_assessment": stats,
         "experiments": experiments,
-        "interpretation_note": "LLM agreement compares model outputs with existing annotations; synthetic/unverified labels require human review.",
+        "interpretation_note": "LLM agreement compares output to existing annotations; synthetic/unverified labels require human review.",
     }
-    _write_outputs(output_dir, results)
-    print(f"\nĐã lưu summary.json và metrics.csv tại {output_dir}")
+    _write_outputs(output_dir, results, args.excel)
+    print(f"\nĐã lưu summary.json, metrics.csv và model_comparison.csv tại {output_dir}")
+    if args.excel:
+        print(f"Đã lưu experiment_report.xlsx tại {output_dir}")
 
 
 if __name__ == "__main__":
